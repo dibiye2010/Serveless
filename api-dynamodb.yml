@@ -1,0 +1,182 @@
+# CloudFormation template to set up the infrastructure that will support the deployment of a lambda Function along with creating 
+# the API Gateway Endpoint and the DynamoDB Table where the messages are kept.
+
+
+
+
+AWSTemplateFormatVersion: 2010-09-09
+Resources:
+  LambdaFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Code:
+        ZipFile: | # Entire code of the Lambda function that will be deployed.
+         const { DynamoDB } = require('aws-sdk');     
+         const endpoint = process.env.DYNAMODB_ENDPOINT || 'http://localhost:8000';
+         const options = {
+            region: 'us-east-1',
+            endpoint: endpoint
+          };
+
+          exports.handler = (event, context, callback) => {
+            const { userId, message } = JSON.parse(event.body);
+
+            const dynamo = new DynamoDB(options);
+            const dbClient = new DynamoDB.DocumentClient({ service: dynamo });
+
+            const timestamp = new Date().toISOString();
+
+            const params = {
+              TableName: 'MessageHistory',
+              Item:{
+                UserId: userId,
+                Timestamp: timestamp,
+                MessageText: message
+              }
+            };
+
+            dbClient.put(params, (err, data) => {
+              if (err) {
+                callback(Error("Unable to add item. Error JSON:", JSON.stringify(err, null, 2)));
+              } else {
+                callback(null, 200);
+              }
+            });
+          };
+      FunctionName:
+        Ref: LambdaFuncName
+      Handler: index.handler
+      Runtime: nodejs12.x
+      Role: !GetAtt IAMRole.Arn
+    DependsOn:
+      - DynamoDBTable
+  DynamoDBTable:
+    Type: 'AWS::DynamoDB::Table'
+    Properties:
+      TableName:
+        Ref: DynamoDBTableName
+      AttributeDefinitions: # A list of attributes that describe the key schema for the table and indexes.
+        - 
+          AttributeName: "UserId"
+          AttributeType: "S"
+
+        - 
+          AttributeName: "Timestamp"
+          AttributeType: "S"
+      KeySchema: # specifies the attributes that make up the primary key of a table.
+        - 
+          AttributeName: "UserId"
+          KeyType: "HASH" # Partition key
+
+        - 
+          AttributeName: "Timestamp" 
+          KeyType: "RANGE" # Sort Key
+      ProvisionedThroughput:
+        ReadCapacityUnits: '5'
+        WriteCapacityUnits: '5'
+    DependsOn:
+      - IAMRole
+  APIGatewayRestAPI: # will be created first
+    Type: 'AWS::ApiGateway::RestApi'
+    Properties:
+      Name:
+        Ref: APIName # refers to API Name defined in the parameters.
+    DependsOn:
+      - LambdaFunction
+  APIGatewayResource: # second to be created.
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref APIGatewayRestAPI # refers to Rest API created above.
+      ParentId: !GetAtt
+        - APIGatewayRestAPI 
+        - RootResourceId
+      PathPart:
+        Ref: LambdaFuncName # path
+    DependsOn:
+      - APIGatewayRestAPI
+  APIGatewayMethod: # Third API to be created
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref APIGatewayRestAPI
+      ResourceId: !Ref APIGatewayResource
+      HttpMethod: POST # http method 
+      AuthorizationType: NONE
+      MethodResponses:
+        - StatusCode: 200
+      Integration:
+        Type: AWS # use for lambda proxy related integration.
+        IntegrationResponses:
+          - StatusCode: 200
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - >-
+            arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaFuncNameArn}/invocations
+          - LambdaFuncNameArn: !GetAtt LambdaFunction.Arn
+    DependsOn:
+      - APIGatewayResource
+  APIGatewayDeployment: # Fourth To be created
+    Type: 'AWS::ApiGateway::Deployment'
+    Properties:
+      RestApiId: !Ref APIGatewayRestAPI
+      StageName:
+        Ref: EnvironmentName # defined in parameters
+    DependsOn:
+      - APIGatewayMethod
+  APIGatewayPermission: # provide api gateway the Rest API permission to call to invoke Lambda Function.
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !GetAtt LambdaFunction.Arn
+      Principal: apigateway.amazonaws.com
+    DependsOn:
+      - APIGatewayDeployment
+  IAMRole: # IAM Role to be created to allow Lambda function to do some actions in DynamoDB Table
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com # role only to be used with lambda Function
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: Policy_api-lambda # Policy to be created
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'dynamodb:BatchGetItem'
+                  - 'dynamodb:BatchWriteItem'
+                  - 'dynamodb:TagResource'
+                  - 'dynamodb:UntagResource'
+                  - 'dynamodb:PutItem'
+                  - 'dynamodb:DeleteItem'
+                  - 'dynamodb:GetItem'
+                  - 'dynamodb:Scan'
+                  - 'dynamodb:Query'
+                  - 'dynamodb:UpdateItem'
+                Resource: '*' # any DynamoDB table that will be provided
+              - Effect: Allow
+                Action: # whenever lambda Function will be executed it can capture all these logs and execute
+                  - 'logs:CreateLogStream'
+                  - 'logs:CreateLogGroup'
+                  - 'logs:PutLogEvents'
+                Resource: '*'
+Parameters:
+  LambdaFuncName:
+    Type: String
+    Default: Lambda_api-Dynamodb # Lambda Function Name
+  DynamoDBTableName:
+    Type: String
+    Default: Dynamo_api-lambda # DynamoDB Table Name
+  APIName:
+    Type: String
+    Default: API_api-lambda # API Name
+  EnvironmentName:
+    Type: String
+    Default: Dev # for Dev Environtment
